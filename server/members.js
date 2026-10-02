@@ -286,6 +286,9 @@ export function vendorSpend(memberId, vendorId, { payMethod = 'cash', benefitId 
     const m = assertActiveMember(memberId)
     const vendor = db.prepare('SELECT * FROM vendors WHERE id=?').get(vendorId)
     if (!vendor) throw new TxError(MEMBER_ERR.VENDOR_NOT_FOUND, '商铺不存在')
+    // 库存联动：未挂物资的商铺不受库存管理；库存不足抛错整体回滚（与后续扣款/券核销同事务）
+    try { ctx.reserveVendorStock?.(vendorId, q) }
+    catch (e) { throw new TxError('VENDOR_OUT_OF_STOCK', e.message || '商铺库存不足，请减少数量或等待补货') }
     const tier = effectiveTier(m)
     const gross = vendor.price * q
     const bill = Math.round(gross * tier.discount_vendor)

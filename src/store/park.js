@@ -62,6 +62,16 @@ function emptyIncidentStats() {
   }
 }
 
+function emptyProcurementStats() {
+  return {
+    draft: 0, submitted: 0, receiving: 0,
+    openFindings: 0, criticalFindings: 0,
+    findingsByType: { shortage: 0, expiry: 0, price: 0, stock_diff: 0, payable: 0 },
+    lowStock: 0, outStock: 0, expiringBatches: 0, stockValue: 0,
+    payable: 0, overduePayable: 0, lostToday: { qty: 0, rev: 0 }, spoilTodayQty: 0, costToday: 0
+  }
+}
+
 export const useParkStore = defineStore('park', {
   state: () => ({
     data: null,
@@ -120,7 +130,16 @@ export const useParkStore = defineStore('park', {
     incidents: s => s.data?.incidents || [],
     incidentStats: s => s.data?.incidentStats || emptyIncidentStats(),
     emergencyConst: s => s.data?.emergencyConst || { severityNames: {}, controlSla: {}, rescueCost: {}, staffSubsidy: {}, types: {} },
-    activeIncidents: s => (s.data?.incidents || []).filter(i => ['reported', 'graded', 'contained', 'evacuating', 'controlled'].includes(i.status))
+    activeIncidents: s => (s.data?.incidents || []).filter(i => ['reported', 'graded', 'contained', 'evacuating', 'controlled'].includes(i.status)),
+    // 物资采购与库存
+    suppliers: s => s.data?.suppliers || [],
+    materials: s => s.data?.materials || [],
+    purchaseOrders: s => s.data?.purchaseOrders || [],
+    purchaseStats: s => s.data?.purchaseStats || emptyProcurementStats(),
+    inventoryFindings: s => s.data?.inventoryFindings || [],
+    stockBatches: s => s.data?.stockBatches || [],
+    stocktakes: s => s.data?.stocktakes || [],
+    purchaseReturns: s => s.data?.purchaseReturns || []
   },
   actions: {
     async refresh() {
@@ -239,6 +258,31 @@ export const useParkStore = defineStore('park', {
     fileIncidentClaim(id, payload) { return this.api('POST', `/incidents/${id}/claims`, payload) },
     payIncidentClaim(claimId, payload) { return this.api('POST', `/incident-claims/${claimId}/pay`, payload) },
     rejectIncidentClaim(claimId, payload) { return this.api('POST', `/incident-claims/${claimId}/reject`, payload) },
-    async incidentDetail(id) { return j('GET', `/incidents/${id}`) }
+    async incidentDetail(id) { return j('GET', `/incidents/${id}`) },
+    // 物资采购与库存
+    saveSupplier(payload, id) { return this.api('POST', id ? `/suppliers/${id}` : '/suppliers', payload) },
+    saveMaterial(payload, id) { return this.api('POST', id ? `/materials/${id}` : '/materials', payload) },
+    setVendorMaterials(vendorId, material_ids) { return this.api('POST', `/vendors/${vendorId}/materials`, { material_ids }) },
+    createPurchaseOrder(payload) { return this.api('POST', '/purchase-orders', payload) },
+    submitPurchaseOrder(id) { return this.api('POST', `/purchase-orders/${id}/submit`, {}) },
+    approvePurchaseOrder(id) { return this.api('POST', `/purchase-orders/${id}/approve`, {}) },
+    rejectPurchaseOrder(id, note) { return this.api('POST', `/purchase-orders/${id}/reject`, { note }) },
+    receivePurchaseOrder(id, receives, note) { return this.api('POST', `/purchase-orders/${id}/receive`, { receives, note }) },
+    payPurchaseOrder(id, amount) { return this.api('POST', `/purchase-orders/${id}/pay`, { amount }) },
+    purchaseReturn(payload) { return this.api('POST', '/purchase-returns', payload) },
+    salesReturn(payload) { return this.api('POST', '/sales-returns', payload) },
+    async purchaseOrderDetail(id) { return j('GET', `/purchase-orders/${id}`) },
+    async supplierDetail(id) { return j('GET', `/suppliers/${id}`) },
+    async materialMovements(id) { return j('GET', `/materials/${id}/movements`) },
+    async stockBatches(query = '') { return j('GET', `/stock-batches${query}`) },
+    async purchaseReturnsList(kind) { return j('GET', `/purchase-returns${kind ? `?kind=${kind}` : ''}`) },
+    createStocktake(payload) { return this.api('POST', '/stocktakes', payload) },
+    submitStocktake(id, actuals) { return this.api('POST', `/stocktakes/${id}/submit`, { actuals }) },
+    approveStocktake(id, note) { return this.api('POST', `/stocktakes/${id}/approve`, { note }) },
+    cancelStocktake(id) { return this.api('POST', `/stocktakes/${id}/cancel`, {}) },
+    async stocktakeDetail(id) { return j('GET', `/stocktakes/${id}`) },
+    async inventoryFindings(query = '') { return j('GET', `/inventory-findings${query}`) },
+    resolveInventoryFinding(id, note) { return this.api('POST', `/inventory-findings/${id}/resolve`, { note }) },
+    ignoreInventoryFinding(id, note) { return this.api('POST', `/inventory-findings/${id}/ignore`, { note }) }
   }
 })

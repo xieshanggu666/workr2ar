@@ -10,6 +10,15 @@ const types = ['餐饮', '纪念品', '饮品']
 const list = computed(() => store.vendors)
 const typeIcon = t => ({ '餐饮':'🍔', '饮品':'🥤', '纪念品':'🎁' }[t])
 
+// 库存联动：商铺所挂物资的最低库存状态（未挂物资=不受库存管理）
+function vStock(v) {
+  const linked = store.materials.filter(m => m.vendors.some(x => x.id === v.id))
+  if (!linked.length) return null
+  const worst = linked.some(m => m.stock_status === 'out') ? 'out'
+    : linked.some(m => m.stock_status === 'low') ? 'low' : 'ok'
+  return { worst, linked }
+}
+
 function submit() {
   store.buildVendor({ ...build.value, name: build.value.name || `新${build.value.type}摊` })
   buildOpen.value = false
@@ -32,6 +41,9 @@ function submit() {
             <b>{{ v.name }}</b>
             <em class="muted">{{ v.type }} · {{ store.zones.find(z=>z.id===v.zone_id)?.name }}</em>
           </div>
+          <span class="inv-badge" :class="vStock(v)?.worst || 'none'" :title="vStock(v) ? vStock(v).linked.map(m=>m.name+'('+m.qty_on_hand+')').join('、') : '未挂物资，不受库存联动'">
+            {{ vStock(v) ? (vStock(v).worst==='out' ? '📦 断货' : vStock(v).worst==='low' ? '📦 偏低' : '📦 充足') : '未管库存' }}
+          </span>
           <button class="ghost danger" @click="store.delVendor(v.id)">✕</button>
         </div>
         <div class="vmeta">
@@ -80,6 +92,11 @@ function submit() {
 .vhead b { display: block; }
 .vhead em { font-style: normal; font-size: 12px; }
 .vhead .ghost { margin-left: auto; }
+.inv-badge { font-size: 11px; padding: 2px 8px; border-radius: 20px; border: 1px solid var(--border); white-space: nowrap; }
+.inv-badge.ok { color: var(--green); border-color: rgba(109,213,160,.4); background: rgba(109,213,160,.12); }
+.inv-badge.low { color: var(--accent2); border-color: rgba(255,209,102,.4); background: rgba(255,209,102,.12); }
+.inv-badge.out { color: var(--red); border-color: rgba(255,107,107,.45); background: rgba(255,107,107,.15); }
+.inv-badge.none { color: var(--muted); }
 .vmeta { display: flex; gap: 8px; margin: 12px 0; }
 .vmeta div { background: var(--panel2); flex: 1; text-align: center; border-radius: 8px; padding: 8px; }
 .vmeta em { display: block; font-style: normal; font-size: 11px; color: var(--muted); }

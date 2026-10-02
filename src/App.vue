@@ -5,6 +5,7 @@ import DashboardView from '@/components/DashboardView.vue'
 import ZoneMapView from '@/components/ZoneMapView.vue'
 import RidesView from '@/components/RidesView.vue'
 import VendorsView from '@/components/VendorsView.vue'
+import ProcurementView from '@/components/ProcurementView.vue'
 import StaffView from '@/components/StaffView.vue'
 import SchedulingView from '@/components/SchedulingView.vue'
 import ClosedLoopView from '@/components/ClosedLoopView.vue'
@@ -25,6 +26,7 @@ const navs = [
   { k: 'zones', icon: '🗺️', label: '园区地图' },
   { k: 'rides', icon: '🎢', label: '游乐设施' },
   { k: 'vendors', icon: '🏪', label: '商铺' },
+  { k: 'procurement', icon: '📦', label: '物资采购库存' },
   { k: 'staff', icon: '👷', label: '员工管理' },
   { k: 'scheduling', icon: '🗓️', label: '排班工时' },
   { k: 'closedloop', icon: '🔄', label: '客流调度闭环' },
@@ -78,6 +80,9 @@ onMounted(store.refresh)
           <span class="halo" v-if="store.reservationStats.oversoldPending">⚠️ {{ store.reservationStats.oversoldPending }} 个超售时段待消化</span>
           <span class="halo" v-if="store.groupStats.pending">🧑‍✈️ {{ store.groupStats.pending }} 个团队待确认</span>
           <span class="halo red" v-if="store.groupStats.interrupted">🚧 {{ store.groupStats.interrupted }} 段团队行程停运待处置</span>
+          <span class="halo red" v-if="store.purchaseStats.criticalFindings">📦 {{ store.purchaseStats.criticalFindings }} 项库存紧急异常（断货/逾期/账实）</span>
+          <span class="halo" v-if="store.purchaseStats.submitted">🛒 {{ store.purchaseStats.submitted }} 张采购单待审批</span>
+          <span class="halo" v-if="store.purchaseStats.lostToday.qty">📉 今日缺货流失 ¥{{ store.purchaseStats.lostToday.rev }}</span>
           <span class="halo red" v-if="store.incidentStats.open">🚨 {{ store.incidentStats.open }} 起安全事件应急中</span>
           <span class="halo" v-if="store.incidentStats.pendingClaims">🩹 {{ store.incidentStats.pendingClaims }} 笔游客理赔待核定</span>
           <span class="halo" v-if="store.memberStats.expiring">💳 {{ store.memberStats.expiring }} 张会员卡即将到期</span>
@@ -95,6 +100,7 @@ onMounted(store.refresh)
         <ZoneMapView v-else-if="view === 'zones'" />
         <RidesView v-else-if="view === 'rides'" />
         <VendorsView v-else-if="view === 'vendors'" />
+        <ProcurementView v-else-if="view === 'procurement'" />
         <StaffView v-else-if="view === 'staff'" />
         <SchedulingView v-else-if="view === 'scheduling'" />
         <ClosedLoopView v-else-if="view === 'closedloop'" />
