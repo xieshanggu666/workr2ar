@@ -58,7 +58,9 @@ const ctx = {
   hour: () => num(getSetting('hour'), 9),
   tick: () => num(getSetting('tick'), 0),
   cash: () => num(getSetting('cash'), 0),
-  logFinance: null
+  logFinance: null,
+  // 采购库存模块注入：商铺销售联动库存（缺货时按可支撑数量成交）。返回 {sold,lost}，未配置返回 null
+  consumeVendorStock: null
 }
 export function initMemberContext(deps) { Object.assign(ctx, deps) }
 
@@ -286,8 +288,18 @@ export function vendorSpend(memberId, vendorId, { payMethod = 'cash', benefitId 
     const m = assertActiveMember(memberId)
     const vendor = db.prepare('SELECT * FROM vendors WHERE id=?').get(vendorId)
     if (!vendor) throw new TxError(MEMBER_ERR.VENDOR_NOT_FOUND, '商铺不存在')
+    // 库存联动：缺货商铺只能按可支撑数量成交；整单缺货直接拒绝（避免收款无货）
+    let dealQty = q
+    let stockLost = 0
+    if (ctx.consumeVendorStock) {
+      const probe = ctx.consumeVendorStock(vendorId, q, { probe: true })
+      if (probe && probe.sold <= 0) {
+        throw new TxError(MEMBER_ERR.VENDOR_STOCKOUT || 'VENDOR_STOCKOUT', `「${vendor.name}」当前缺货，暂时无法购买`)
+      }
+      if (probe) { dealQty = probe.sold; stockLost = probe.lost }
+    }
     const tier = effectiveTier(m)
-    const gross = vendor.price * q
+    const gross = vendor.price * dealQty
     const bill = Math.round(gross * tier.discount_vendor)
 
     let cashPart = 0, balancePart = 0, voucherPart = 0, usedBenefit = null
@@ -312,17 +324,22 @@ export function vendorSpend(memberId, vendorId, { payMethod = 'cash', benefitId 
 
     // 商铺确认收入：现金部分；储值部分为负债转收入（不产生新现金）
     const recognized = cashPart + balancePart
-    db.prepare('UPDATE vendors SET sold=sold+?, rev=rev+? WHERE id=?').run(q, recognized, vendorId)
-    if (cashPart > 0) ctx.logFinance?.(ctx.day(), '商业', cashPart, `${m.code} 会员在「${vendor.name}」现金消费`)
-    if (balancePart > 0) ctx.logFinance?.(ctx.day(), '商业', balancePart, `${m.code} 会员在「${vendor.name}」储值消费（负债转收入）`)
+    // 库存联动：收款同时按实际成交数量扣减库存（同一事务，缺货流失留痕）
+    if (ctx.consumeVendorStock && dealQty > 0) {
+      const cr = ctx.consumeVendorStock(vendorId, dealQty, { source: 'member' })
+      if (cr && cr.sold !== dealQty) throw new TxError('STOCK_CHANGED', '库存发生变化，请重新下单')
+    }
+    db.prepare('UPDATE vendors SET sold=sold+?, rev=rev+? WHERE id=?').run(dealQty, recognized, vendorId)
+    if (cashPart > 0) ctx.logFinance?.(ctx.day(), '商业', cashPart, `${m.code} 会员在「${vendor.name}」现金消费${stockLost ? `（缺货少售 ${stockLost} 份）` : ''}`)
+    if (balancePart > 0) ctx.logFinance?.(ctx.day(), '商业', balancePart, `${m.code} 会员在「${vendor.name}」储值消费（负债转收入）${stockLost ? `（缺货少售 ${stockLost} 份）` : ''}`)
     if (voucherPart > 0) ctx.logFinance?.(ctx.day(), '会员权益', -voucherPart, `${m.code} 核销消费券（营销成本）·「${vendor.name}」`)
 
     const pts = calcPoints(recognized, tier.point_mul)
     if (pts) addPoints(memberId, pts, 'vendor', 'vendor', vendorId, `「${vendor.name}」消费 ¥${recognized}（${voucherPart ? '券抵 ¥' + voucherPart : ''}）`)
     logMember(memberId, 'vendor',
-      `「${vendor.name}」消费 ${q} 份：${cashPart ? `现金 ¥${cashPart} ` : ''}${balancePart ? `储值 ¥${balancePart} ` : ''}${voucherPart ? `消费券抵 ¥${voucherPart}` : ''}，获 ${pts} 积分`)
+      `「${vendor.name}」消费 ${dealQty} 份：${cashPart ? `现金 ¥${cashPart} ` : ''}${balancePart ? `储值 ¥${balancePart} ` : ''}${voucherPart ? `消费券抵 ¥${voucherPart}` : ''}，获 ${pts} 积分${stockLost ? `；缺货流失 ${stockLost} 份` : ''}`)
     touchMember(memberId)
-    return { ok: true, bill, cashPart, balancePart, voucherPart, points: pts }
+    return { ok: true, bill, cashPart, balancePart, voucherPart, points: pts, qty: dealQty, lost: stockLost }
   })
 }
 

@@ -52,6 +52,18 @@ import {
 } from './emergency.js'
 import { emergencyCloseEntrySlots, emergencyReopenEntrySlots } from './reservations.js'
 import { initRideContext, upgradeRide } from './rides.js'
+import {
+  initInventoryContext,
+  createSupplier, updateSupplier, listSuppliers,
+  createMaterial, updateMaterial, listMaterials,
+  setVendorMaterial, removeVendorMaterial,
+  createPurchaseOrder, submitPurchaseOrder, approvePurchaseOrder, cancelPurchaseOrder,
+  receivePurchase, closePurchaseShortage, purchaseOrderDetail, listPurchaseOrders,
+  createPurchaseReturn, confirmPurchaseReturn, rejectPurchaseReturn, listReturns,
+  paySupplierBill, listBills, billDetail,
+  createStocktake, saveStocktakeCount, finishStocktake, cancelStocktake, listStocktakes, stocktakeDetail,
+  consumeVendorSale, inventoryLogs, inventoryStats, runInventoryReconcile, processInventory
+} from './inventory.js'
 
 const app = express()
 app.use(express.json())
@@ -100,6 +112,19 @@ function logFinance(day, label, amount, detail) {
   db.prepare('INSERT INTO finance(tick,day,label,amount,detail) VALUES(?,?,?,?,?)')
     .run(state.tick(), day, label, Math.round(amount), detail || '')
 }
+
+// 物资采购与库存：时钟 / 现金 / 财务流水 / 事件推送（采购付款、退货退现、盘亏报损逐笔入账）
+initInventoryContext({
+  logFinance,
+  createEvent: ({ type = 'inventory', title, desc, impact = -1 }) => {
+    db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+      .run(state.tick(), state.day(), type, title, desc, impact, 'active')
+  }
+})
+// 会员商铺消费 → 库存联动（收款前 probe、成交后同一事务扣库存；缺货按可支撑数量成交）
+initMemberContext({
+  consumeVendorStock: (vendorId, qty, opts = {}) => consumeVendorSale(vendorId, qty, opts)
+})
 
 // 分时预约模块共享：时钟 / 现金 / 财务流水 / 投诉建单
 initReservationContext({
@@ -752,27 +777,49 @@ function tick() {
     db.prepare('UPDATE zones SET cleanliness=? WHERE id=?').run(Math.round(c), z.id)
   }
 
-  // 商铺营收
+  // 商铺营收（销售联动库存：按物资目录 FEFO 出库，缺货只确认实际成交量并计流失损失）
   const activeZoneIds = zones.filter(z => z.open).map(z => z.id)
   const vendors = allVendors().filter(v => activeZoneIds.includes(v.zone_id))
   const vStmt = db.prepare('UPDATE vendors SET sold=sold+?, rev=rev+? WHERE id=?')
   let vendorIncome = 0
+  let vendorLost = 0
   for (const v of vendors) {
     const zone = zones.find(z => z.id === v.zone_id)
     const zFlow = (zone ? zone.capacity : 150) * (satisfaction / 100)
-    const sold = Math.round(Math.min(zFlow / 8, entering / 6) * (0.8 + Math.random() * 0.4))
+    const demand = Math.round(Math.min(zFlow / 8, entering / 6) * (0.8 + Math.random() * 0.4))
+    // 库存联动：缺货时只成交可支撑数量（consumeVendorSale 内部同事务出库并对流失留痕）
+    const r = consumeVendorSale(v.id, demand, { source: 'guest' })
+    const sold = r.noCatalog ? demand : r.sold
+    const lost = r.noCatalog ? 0 : r.lost
     const income = Math.round(sold * v.price * v.margin)
     vendorIncome += income
+    vendorLost += Math.round(lost * v.price * v.margin)
     cash += income
     vStmt.run(sold, income, v.id)
   }
-  if (vendorIncome > 0) logFinance(day, '商业', vendorIncome, '商铺营收')
+  if (vendorIncome > 0) logFinance(day, '商业', vendorIncome, '商铺营收（按实际库存成交）')
+  if (vendorLost > 0) {
+    // 缺货流失汇总：当日只落一条汇总事件（逐商铺断供预警在 consumeVendorSale 内单独去重推送）
+    const dup = db.prepare("SELECT id FROM events WHERE type='inventory' AND day=? AND title='商铺缺货销售流失汇总' LIMIT 1").get(day)
+    if (!dup) {
+      db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+        .run(state.tick(), day, 'inventory', '商铺缺货销售流失汇总',
+          `今日商铺因物资缺货流失销售机会（毛利口径约 ¥${vendorLost} 起）。请在「采购库存」页关注预警、及时补货并核对供应商账单。`,
+          -1, 'active')
+    }
+  }
 
   // 需求侧：模拟游客为未来三天的入园/设施时段下单预约（预收款即入账）
   autoBookDemand(allRides(), base, priceFactor, repFactor * complaintFactor)
 
   // 会员经济：会员按卡等级折扣自助预约（复用预约事务/库存一致性）、商铺储值/券消费、散客办卡转化
   autoMemberEconomy({ rides: ops, vendors })
+
+  // 物资采购与库存：到期采购单自动到货、过期批次报损、低于安全库存自动生成补貨申购
+  const invTick = processInventory()
+  if (invTick.received > 0 || invTick.orders > 0) {
+    console.log(`[inventory] 自动到货 ${invTick.received} 单，自动申购 ${invTick.orders} 单，过期报损 ¥${invTick.loss || 0}`)
+  }
 
   // 员工满意度
   const sm = db.prepare('UPDATE staff SET morale=? WHERE id=?')
@@ -857,12 +904,17 @@ function tick() {
   // 整点巡检落事件（与上次结果去重，避免刷屏）
   try {
     const rc = runReconcile({ autoHeal: true })
-    if (rc.found > 0 && rc.blocks > 0) {
+    // 采购库存域巡检：库存计数器/批次漂移自愈，供应商账单资金口径异常只告警
+    let invRC = { found: 0, healed: 0, blocks: 0 }
+    try { invRC = runInventoryReconcile({ autoHeal: true }) } catch (e) { console.error('[inventory] 库存对账失败:', e) }
+    const foundAll = rc.found + invRC.found
+    const blocksAll = rc.blocks + invRC.blocks
+    if (foundAll > 0 && blocksAll > 0) {
       const lastEvt = db.prepare("SELECT id FROM events WHERE type='reconcile' AND day=? ORDER BY id DESC LIMIT 1").get(day)
       if (!lastEvt) {
         db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
-          .run(tickCount, day, 'reconcile', '闭环巡检发现排班/预约/财务口径异常',
-            `本轮巡检发现 ${rc.found} 项偏差（严重 ${rc.blocks} 项，已自愈 ${rc.healed} 项）。计数器漂移已自动校正；资金/团账/跨日排班冲突需人工在「客流调度闭环」页核对处理。`,
+          .run(tickCount, day, 'reconcile', '闭环巡检发现排班/预约/库存/财务口径异常',
+            `本轮巡检发现 ${foundAll} 项偏差（严重 ${blocksAll} 项，已自愈 ${rc.healed + invRC.healed} 项）。计数器漂移已自动校正；资金/团账/供应商账单冲突需人工在「客流调度闭环」页核对处理。`,
             -1, 'active')
       }
     }
@@ -1017,6 +1069,15 @@ app.get('/api/state', (req, res) => {
     // 园区应急指挥：安全事件状态机与统计（在途事件置前）
     incidents: listIncidents({ limit: 80 }),
     incidentStats: incidentStats(),
+    // 物资采购与库存：供应商/物资库存/采购单/账单/退货/盘点/库存流水/统计
+    suppliers: listSuppliers(),
+    materials: listMaterials(),
+    purchaseOrders: listPurchaseOrders({ limit: 100 }),
+    supplierBills: listBills({ status: 'all' }),
+    purchaseReturns: listReturns({ limit: 60 }),
+    stocktakes: listStocktakes({ limit: 30 }),
+    inventoryLedger: inventoryLogs({ limit: 80 }),
+    inventoryStats: inventoryStats(),
     emergencyConst: {
       severityNames: EMERGENCY_CONST.SEVERITY_NAMES,
       controlSla: EMERGENCY_CONST.CONTROL_SLA,
@@ -2140,6 +2201,141 @@ app.post('/api/incident-claims/:id/reject', (req, res) => {
     handlerId: b.handler_id ? num(b.handler_id) : null,
     requestId: idemKey(req)
   }))
+})
+
+// ================= 园区物资采购与库存 =================
+// ---- 供应商 ----
+app.post('/api/suppliers', (req, res) => reply(req, res, createSupplier(req.body || {}), 201))
+app.post('/api/suppliers/:id', (req, res) => reply(req, res, updateSupplier(num(req.params.id), req.body || {})))
+
+// ---- 物资目录 ----
+app.post('/api/materials', (req, res) => reply(req, res, createMaterial(req.body || {}), 201))
+app.post('/api/materials/:id', (req, res) => reply(req, res, updateMaterial(num(req.params.id), req.body || {})))
+
+// 商铺物资目录（运营与商铺协同配置售卖物料与单耗）
+app.post('/api/vendors/:id/materials', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, setVendorMaterial(num(req.params.id), num(b.material_id), num(b.qty_per_sale, 1)))
+})
+app.delete('/api/vendors/:id/materials/:mid', (req, res) => {
+  reply(req, res, removeVendorMaterial(num(req.params.id), num(req.params.mid)))
+})
+
+// ---- 采购单 ----
+app.post('/api/purchase-orders', (req, res) => reply(req, res, createPurchaseOrder(req.body || {}), 201))
+app.get('/api/purchase-orders', (req, res) => {
+  res.json({ list: listPurchaseOrders({ status: String(req.query.status || 'all') }), stats: inventoryStats() })
+})
+app.get('/api/purchase-orders/:id', (req, res) => {
+  const d = purchaseOrderDetail(num(req.params.id))
+  if (!d) return res.status(404).json({ ok: false, msg: '采购单不存在' })
+  res.json(d)
+})
+app.post('/api/purchase-orders/:id/submit', (req, res) => reply(req, res, submitPurchaseOrder(num(req.params.id))))
+app.post('/api/purchase-orders/:id/approve', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, approvePurchaseOrder(num(req.params.id), {
+    approve: b.approve !== false,
+    staffId: b.staff_id ? num(b.staff_id) : null,
+    note: String(b.note || '')
+  }))
+})
+app.post('/api/purchase-orders/:id/cancel', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, cancelPurchaseOrder(num(req.params.id), { note: String(b.note || '') }))
+})
+// 验收入库（支持分批/少送/破损登记）
+app.post('/api/purchase-orders/:id/receive', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, receivePurchase(num(req.params.id), {
+    items: b.items || [],
+    source: 'manual',
+    staff_id: b.staff_id ? num(b.staff_id) : null,
+    note: String(b.note || '')
+  }))
+})
+// 少送结案（供应商确认剩余数量不再补发）
+app.post('/api/purchase-orders/:id/close-shortage', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, closePurchaseShortage(num(req.params.id), {
+    staffId: b.staff_id ? num(b.staff_id) : null, note: String(b.note || '')
+  }))
+})
+
+// ---- 采购退货 ----
+app.post('/api/purchase-returns', (req, res) => reply(req, res, createPurchaseReturn(req.body || {}), 201))
+app.get('/api/purchase-returns', (req, res) => {
+  res.json({ list: listReturns({ status: String(req.query.status || 'all') }) })
+})
+app.post('/api/purchase-returns/:id/confirm', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, confirmPurchaseReturn(num(req.params.id), {
+    refundMode: b.refund_mode === 'cash' ? 'cash' : 'deduct',
+    staffId: b.staff_id ? num(b.staff_id) : null,
+    note: String(b.note || '')
+  }))
+})
+app.post('/api/purchase-returns/:id/reject', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, rejectPurchaseReturn(num(req.params.id), {
+    staffId: b.staff_id ? num(b.staff_id) : null, note: String(b.note || '')
+  }))
+})
+
+// ---- 供应商账单与财务结算 ----
+app.get('/api/supplier-bills', (req, res) => {
+  res.json({ list: listBills({ status: String(req.query.status || 'all') }) })
+})
+app.get('/api/supplier-bills/:id', (req, res) => {
+  const d = billDetail(num(req.params.id))
+  if (!d) return res.status(404).json({ ok: false, msg: '账单不存在' })
+  res.json(d)
+})
+app.post('/api/supplier-bills/:id/pay', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, paySupplierBill(num(req.params.id), {
+    amount: b.amount !== undefined ? num(b.amount) : undefined,
+    staff_id: b.staff_id ? num(b.staff_id) : null,
+    note: String(b.note || '')
+  }))
+})
+
+// ---- 盘点 ----
+app.post('/api/stocktakes', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, createStocktake({ staffId: b.staff_id ? num(b.staff_id) : null, note: String(b.note || '') }), 201)
+})
+app.get('/api/stocktakes', (req, res) => res.json({ list: listStocktakes() }))
+app.get('/api/stocktakes/:id', (req, res) => {
+  const d = stocktakeDetail(num(req.params.id))
+  if (!d) return res.status(404).json({ ok: false, msg: '盘点单不存在' })
+  res.json(d)
+})
+app.post('/api/stocktakes/:id/count', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, saveStocktakeCount(num(req.params.id), num(b.material_id), num(b.actual_qty)))
+})
+app.post('/api/stocktakes/:id/finish', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, finishStocktake(num(req.params.id), { staffId: b.staff_id ? num(b.staff_id) : null, note: String(b.note || '') }))
+})
+app.post('/api/stocktakes/:id/cancel', (req, res) => reply(req, res, cancelStocktake(num(req.params.id))))
+
+// ---- 库存流水 / 手动对账 ----
+app.get('/api/inventory-logs', (req, res) => {
+  const q = req.query || {}
+  res.json({
+    list: inventoryLogs({
+      day: q.day ? num(q.day) : null,
+      vendorId: q.vendorId ? num(q.vendorId) : null,
+      materialId: q.materialId ? num(q.materialId) : null,
+      limit: 200
+    })
+  })
+})
+app.post('/api/inventory/reconcile', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, { ok: true, ...runInventoryReconcile({ autoHeal: b.auto_heal !== false }) })
 })
 
 // 全局异常兜底：未捕获错误统一返回可追踪的 500（请求号写入服务端日志）

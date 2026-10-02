@@ -5,6 +5,7 @@ import DashboardView from '@/components/DashboardView.vue'
 import ZoneMapView from '@/components/ZoneMapView.vue'
 import RidesView from '@/components/RidesView.vue'
 import VendorsView from '@/components/VendorsView.vue'
+import InventoryView from '@/components/InventoryView.vue'
 import StaffView from '@/components/StaffView.vue'
 import SchedulingView from '@/components/SchedulingView.vue'
 import ClosedLoopView from '@/components/ClosedLoopView.vue'
@@ -25,6 +26,7 @@ const navs = [
   { k: 'zones', icon: '🗺️', label: '园区地图' },
   { k: 'rides', icon: '🎢', label: '游乐设施' },
   { k: 'vendors', icon: '🏪', label: '商铺' },
+  { k: 'inventory', icon: '📦', label: '采购库存' },
   { k: 'staff', icon: '👷', label: '员工管理' },
   { k: 'scheduling', icon: '🗓️', label: '排班工时' },
   { k: 'closedloop', icon: '🔄', label: '客流调度闭环' },
@@ -81,6 +83,10 @@ onMounted(store.refresh)
           <span class="halo red" v-if="store.incidentStats.open">🚨 {{ store.incidentStats.open }} 起安全事件应急中</span>
           <span class="halo" v-if="store.incidentStats.pendingClaims">🩹 {{ store.incidentStats.pendingClaims }} 笔游客理赔待核定</span>
           <span class="halo" v-if="store.memberStats.expiring">💳 {{ store.memberStats.expiring }} 张会员卡即将到期</span>
+          <span class="halo red" v-if="store.inventoryStats.out">📦 {{ store.inventoryStats.out }} 种物资断货</span>
+          <span class="halo" v-if="store.inventoryStats.low">⚠️ {{ store.inventoryStats.low }} 种物资低于安全库存</span>
+          <span class="halo" v-if="store.inventoryStats.pendingOrders">🛒 {{ store.inventoryStats.pendingOrders }} 张采购单待审批</span>
+          <span class="halo red" v-if="store.inventoryStats.overdueBills">🧾 {{ store.inventoryStats.overdueBills }} 张供应商账单待结</span>
         </div>
         <div class="stats">
           <div class="pill">💰 <b :class="store.data && store.data.cash < 0 ? 'neg money' : 'money'">{{ store.data?.cash?.toLocaleString() ?? 0 }}</b></div>
@@ -95,6 +101,7 @@ onMounted(store.refresh)
         <ZoneMapView v-else-if="view === 'zones'" />
         <RidesView v-else-if="view === 'rides'" />
         <VendorsView v-else-if="view === 'vendors'" />
+        <InventoryView v-else-if="view === 'inventory'" />
         <StaffView v-else-if="view === 'staff'" />
         <SchedulingView v-else-if="view === 'scheduling'" />
         <ClosedLoopView v-else-if="view === 'closedloop'" />

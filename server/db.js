@@ -794,6 +794,257 @@ CREATE TABLE IF NOT EXISTS incident_claims (
   handle_day INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_incident_claims_inc ON incident_claims(incident_id,status);
+
+-- ========== 园区物资采购与库存：供应商 → 采购单 → 入库批次 → 库存 → 商铺销售/退货/结算/盘点 ==========
+-- 供应商（运营与商铺协同：商铺可发起申购，运营统一维护供应商与采购单）
+CREATE TABLE IF NOT EXISTS suppliers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',           -- GYS001
+  name TEXT NOT NULL,
+  contact TEXT NOT NULL DEFAULT '',        -- 联系人
+  phone TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL DEFAULT '综合',    -- 原料/包装/百货/综合
+  lead_days INTEGER NOT NULL DEFAULT 2,    -- 默认供货周期（游戏日）
+  rating INTEGER NOT NULL DEFAULT 3,       -- 合作评级 1-5（影响按时到货率）
+  status TEXT NOT NULL DEFAULT 'active',   -- active 合作中 / suspended 暂停合作
+  note TEXT NOT NULL DEFAULT '',
+  created_day INTEGER NOT NULL DEFAULT 1
+);
+
+-- 物资目录（园区统一定义物资：原料/包装/周边百货；标准成本用于申购核价与成本核算）
+CREATE TABLE IF NOT EXISTS materials (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',           -- WZ0001
+  name TEXT NOT NULL,
+  category TEXT NOT NULL DEFAULT '原料',    -- 原料/包装/百货
+  unit TEXT NOT NULL DEFAULT '份',          -- 份/箱/件/瓶
+  std_cost INTEGER NOT NULL DEFAULT 0,     -- 标准采购成本（¥，最近入库价会回写参考）
+  last_cost INTEGER NOT NULL DEFAULT 0,    -- 最近入库单价
+  safety_stock INTEGER NOT NULL DEFAULT 80,-- 安全库存：低于此值触发缺货预警/自动申购
+  target_stock INTEGER NOT NULL DEFAULT 300, -- 目标库存：自动申购补足到此水位
+  shelf_days INTEGER NOT NULL DEFAULT 0,   -- 保质期（游戏日，0=不过期）
+  status TEXT NOT NULL DEFAULT 'on',       -- on 启用 / off 停用
+  note TEXT NOT NULL DEFAULT ''
+);
+
+-- 商铺-物资目录：商铺售卖时消耗对应物资（多对多）；一个物资可由多个商铺使用
+CREATE TABLE IF NOT EXISTS vendor_materials (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  vendor_id INTEGER NOT NULL,
+  material_id INTEGER NOT NULL,
+  qty_per_sale INTEGER NOT NULL DEFAULT 1, -- 每卖出 1 份商品消耗该物资数量
+  UNIQUE (vendor_id, material_id)
+);
+CREATE INDEX IF NOT EXISTS idx_vmat_vendor ON vendor_materials(vendor_id);
+CREATE INDEX IF NOT EXISTS idx_vmat_material ON vendor_materials(material_id);
+
+-- 采购单：draft 商铺申购草稿 → pending 运营待审批 → approved 已批准(待到货) → receiving 部分入库
+--         → received 全部入库 → closed 已结清（账单付清）；rejected 驳回 / cancelled 撤销
+CREATE TABLE IF NOT EXISTS purchase_orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',           -- CG0001
+  supplier_id INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'draft',
+  source TEXT NOT NULL DEFAULT 'manual',   -- manual 运营采购 / shop 商铺申购 / auto 缺货自动申购
+  vendor_id INTEGER,                       -- 申购商铺（shop/auto 记录来源铺位）
+  creator_staff_id INTEGER,                -- 发起人（运营/商铺员工）
+  approver_id INTEGER,                     -- 审批运营主管
+  total_qty INTEGER NOT NULL DEFAULT 0,
+  total_amount INTEGER NOT NULL DEFAULT 0, -- 采购总额（明细行合计快照）
+  received_qty INTEGER NOT NULL DEFAULT 0, -- 已入库总数量（跨批次累计）
+  arrive_day INTEGER NOT NULL DEFAULT 0,   -- 预计到货游戏日（批准日 + 供应商周期）
+  arrived_tick INTEGER NOT NULL DEFAULT 0,
+  settled_day INTEGER NOT NULL DEFAULT 0,  -- 账单结清日（0=未结清）
+  reject_reason TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  created_tick INTEGER NOT NULL DEFAULT 0,
+  created_day INTEGER NOT NULL DEFAULT 0,
+  approve_tick INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_po_status ON purchase_orders(status);
+CREATE INDEX IF NOT EXISTS idx_po_supplier ON purchase_orders(supplier_id);
+CREATE INDEX IF NOT EXISTS idx_po_arrive ON purchase_orders(arrive_day,status);
+
+-- 采购明细行
+CREATE TABLE IF NOT EXISTS purchase_order_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id INTEGER NOT NULL,
+  material_id INTEGER NOT NULL,
+  qty INTEGER NOT NULL,                    -- 采购数量
+  unit_cost INTEGER NOT NULL,              -- 下单单价
+  amount INTEGER NOT NULL DEFAULT 0,       -- qty*unit_cost
+  received_qty INTEGER NOT NULL DEFAULT 0, -- 已入库数量
+  UNIQUE (order_id, material_id)
+);
+CREATE INDEX IF NOT EXISTS idx_poi_order ON purchase_order_items(order_id);
+
+-- 入库批次：一次到货可分批验收（部分到货/分批入库）；验收差异（少送/破损）走异常挂起
+CREATE TABLE IF NOT EXISTS inbound_batches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',           -- RK0001
+  order_id INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'done',     -- done 已入库 / disputed 验收异常待对账
+  source TEXT NOT NULL DEFAULT 'manual',   -- manual 人工验收 / auto 到期自动到货
+  recv_staff_id INTEGER,
+  total_qty INTEGER NOT NULL DEFAULT 0,
+  total_amount INTEGER NOT NULL DEFAULT 0,
+  shortage_qty INTEGER NOT NULL DEFAULT 0, -- 少送数量（订单未交，后续补发/冲减账单）
+  damaged_qty INTEGER NOT NULL DEFAULT 0,  -- 破损数量（验收不合格，不入库，索赔/退货）
+  tick INTEGER NOT NULL DEFAULT 0,
+  day INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_inb_order ON inbound_batches(order_id);
+
+-- 入库批次明细（按物资记录实收、少送、破损；实收增加库存并生成批次库存）
+CREATE TABLE IF NOT EXISTS inbound_batch_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id INTEGER NOT NULL,
+  order_item_id INTEGER NOT NULL,
+  material_id INTEGER NOT NULL,
+  recv_qty INTEGER NOT NULL DEFAULT 0,
+  damaged_qty INTEGER NOT NULL DEFAULT 0,
+  shortage_qty INTEGER NOT NULL DEFAULT 0,
+  unit_cost INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_inbi_batch ON inbound_batch_items(batch_id);
+
+-- 库存批次（带成本与保质期：移动平均成本核算、FEFO 出库）
+CREATE TABLE IF NOT EXISTS stock_batches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  material_id INTEGER NOT NULL,
+  inbound_item_id INTEGER,                 -- 来源入库明细
+  qty_in INTEGER NOT NULL,                 -- 入库数量
+  qty_remain INTEGER NOT NULL,             -- 剩余数量
+  unit_cost INTEGER NOT NULL DEFAULT 0,
+  expire_day INTEGER NOT NULL DEFAULT 0,   -- 0=不过期
+  in_day INTEGER NOT NULL DEFAULT 0,
+  in_tick INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_sbatch_mat ON stock_batches(material_id,qty_remain);
+
+-- 物资库存汇总（计数器；以 stock_batches / stock_ledger 为事实源，巡检漂移可自愈）
+CREATE TABLE IF NOT EXISTS material_stock (
+  material_id INTEGER PRIMARY KEY,
+  onhand_qty INTEGER NOT NULL DEFAULT 0,   -- 现有库存（= 各批次剩余合计）
+  reserved_qty INTEGER NOT NULL DEFAULT 0, -- 占用（在途已批准采购不占库存，预留扩展）
+  avg_cost INTEGER NOT NULL DEFAULT 0,     -- 移动平均成本（元，整数四舍五入）
+  total_in_qty INTEGER NOT NULL DEFAULT 0,
+  total_out_qty INTEGER NOT NULL DEFAULT 0,
+  alert_status TEXT NOT NULL DEFAULT 'ok'  -- ok 正常 / low 低于安全库存 / out 缺货
+);
+
+-- 库存流水（入/出/退货/盘盈盘亏，逐条可对账；商铺销售出库在此留痕）
+CREATE TABLE IF NOT EXISTS stock_ledger (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  material_id INTEGER NOT NULL,
+  change_qty INTEGER NOT NULL,             -- 正=入库，负=出库/盘亏
+  balance_after INTEGER NOT NULL,
+  kind TEXT NOT NULL,                      -- inbound 采购入库 / sale 商铺销售 / return_in 退货入库 / return_out 退货出库 / adjust+ / adjust-
+  ref_type TEXT NOT NULL DEFAULT '',       -- batch/order/vendor/stocktake/return
+  ref_id INTEGER,
+  vendor_id INTEGER,                       -- 商铺销售/退货来源
+  unit_cost INTEGER NOT NULL DEFAULT 0,
+  day INTEGER NOT NULL,
+  tick INTEGER NOT NULL,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_mat ON stock_ledger(material_id,day);
+CREATE INDEX IF NOT EXISTS idx_ledger_vendor ON stock_ledger(vendor_id,day);
+
+-- 采购退货单：退给供应商（入库后质量问题/多发）；未付款冲减应付，已付款生成应收/挂账待追偿
+CREATE TABLE IF NOT EXISTS purchase_returns (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',           -- RT0001
+  supplier_id INTEGER NOT NULL,
+  order_id INTEGER,                        -- 关联原采购单（可空，无单退货）
+  batch_id INTEGER,                        -- 关联入库批次
+  material_id INTEGER NOT NULL,
+  qty INTEGER NOT NULL,
+  unit_cost INTEGER NOT NULL DEFAULT 0,
+  amount INTEGER NOT NULL DEFAULT 0,
+  reason TEXT NOT NULL DEFAULT '',         -- quality 质量问题 / over 多发退回 / damage 破损 / other
+  status TEXT NOT NULL DEFAULT 'submitted',-- submitted 待供应商确认 / confirmed 已确认冲账 / rejected 供应商驳回
+  refund_status TEXT NOT NULL DEFAULT 'none', -- none 未结算 / deducted 已冲减应付 / receivable 已付挂应收 / cash 已退现
+  staff_id INTEGER,
+  tick INTEGER NOT NULL DEFAULT 0,
+  day INTEGER NOT NULL DEFAULT 0,
+  handle_tick INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_pret_status ON purchase_returns(status,refund_status);
+
+-- 供应商账单（采购入库即形成应付；付款/退货冲减逐条留痕，财务结算与对账依据）
+CREATE TABLE IF NOT EXISTS supplier_bills (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',           -- ZD0001
+  supplier_id INTEGER NOT NULL,
+  order_id INTEGER,                        -- 来源采购单（首笔入库时建账单）
+  batch_id INTEGER,                        -- 最近入库批次
+  amount_due INTEGER NOT NULL DEFAULT 0,   -- 应付合计（入库累计）
+  amount_paid INTEGER NOT NULL DEFAULT 0,  -- 已现金支付
+  amount_returned INTEGER NOT NULL DEFAULT 0, -- 退货冲减合计
+  status TEXT NOT NULL DEFAULT 'open',     -- open 未结清 / settled 已结清 / partial 部分支付
+  due_day INTEGER NOT NULL DEFAULT 0,
+  created_tick INTEGER NOT NULL DEFAULT 0,
+  created_day INTEGER NOT NULL DEFAULT 0,
+  settle_tick INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_bills_supplier ON supplier_bills(supplier_id,status);
+
+-- 账单收付流水（入库不产生现金；付款为现金流出，退货冲减/退款逐笔记录）
+CREATE TABLE IF NOT EXISTS supplier_bill_payments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  bill_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,                      -- pay 现金付款 / return 退货冲减 / refund 供应商退现
+  amount INTEGER NOT NULL,                 -- pay/refund 为现金（pay 负向流出），return 为冲减额
+  day INTEGER NOT NULL,
+  tick INTEGER NOT NULL,
+  staff_id INTEGER,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_bpay_bill ON supplier_bill_payments(bill_id);
+
+-- 盘点单：实盘差异生成盘盈/盘亏流水并校准计数器；block 级差异自动进入异常对账
+CREATE TABLE IF NOT EXISTS stocktakes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',           -- PD0001
+  status TEXT NOT NULL DEFAULT 'counting', -- counting 盘点中 / done 已完成 / cancelled 已作废
+  staff_id INTEGER,
+  variance_amount INTEGER NOT NULL DEFAULT 0,  -- 盘盈-盘亏成本净额（正=盘盈）
+  variance_qty INTEGER NOT NULL DEFAULT 0,
+  tick INTEGER NOT NULL DEFAULT 0,
+  day INTEGER NOT NULL DEFAULT 0,
+  finish_tick INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS stocktake_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  stocktake_id INTEGER NOT NULL,
+  material_id INTEGER NOT NULL,
+  book_qty INTEGER NOT NULL,               -- 账面数量（建单时快照）
+  actual_qty INTEGER NOT NULL DEFAULT 0,   -- 实盘数量
+  diff_qty INTEGER NOT NULL DEFAULT 0,
+  unit_cost INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (stocktake_id, material_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sti_head ON stocktake_items(stocktake_id);
+
+-- 采购/库存全生命周期时间线（申购/审批/入库/退货/结算/盘点/预警）
+CREATE TABLE IF NOT EXISTS purchase_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id INTEGER,
+  material_id INTEGER,
+  supplier_id INTEGER,
+  tick INTEGER NOT NULL,
+  day INTEGER NOT NULL,
+  hour INTEGER NOT NULL DEFAULT 0,
+  action TEXT NOT NULL,    -- create/submit/approve/reject/cancel/receive/shortage/return/pay/stock_alert/stockout/auto_order
+  note TEXT NOT NULL DEFAULT '',
+  staff_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_plog_order ON purchase_logs(order_id);
 `)
 
 // ---------- 轻量列迁移（兼容老库） ----------
@@ -1063,6 +1314,73 @@ function ensureScheduleBaseData() {
   }
 }
 ensureScheduleBaseData()
+
+// ---------- 老库兼容：幂等补齐物资采购与库存模块基础数据（供应商/物资/商铺目录/期初库存/模块参数） ----------
+function ensureProcurementBaseData() {
+  const setIf = (k, v) => { if (!getSetting(k)) setSetting(k, String(v)) }
+  setIf('invAutoOrder', 1)      // 缺货自动申购总开关（低于安全库存自动生成采购单）
+  setIf('invAutoApprove', 0)    // 自动申购单是否免审批直接批准（0=进入待审批，运营主管协同审批）
+  setIf('invAlertEvent', 1)     // 缺货/低库存预警是否推送经营事件
+
+  const isup = db.prepare(`INSERT OR IGNORE INTO suppliers(code,name,contact,phone,category,lead_days,rating,status,created_day)
+    VALUES(?,?,?,?,?,?,?, 'active', 1)`)
+  ;[
+    ['GYS001', '鲜丰食品原料厂', '陈经理', '13900001111', '原料', 1, 4],
+    ['GYS002', '绿源包装耗材', '陈包装', '13900002222', '包装', 2, 3],
+    ['GYS003', '潮玩百货批发中心', '王总', '13900003333', '百货', 3, 4]
+  ].forEach(s => isup.run(...s))
+
+  const im = db.prepare(`INSERT OR IGNORE INTO materials
+      (code,name,category,unit,std_cost,last_cost,safety_stock,target_stock,shelf_days,status)
+      VALUES(?,?,?,?,?,?,?,?,?, 'on')`)
+  const mats = [
+    ['WZ0001', '爆米花玉米粒', '原料', '份', 3, 3, 80, 320, 10],
+    ['WZ0002', '热狗面包胚', '原料', '份', 2, 2, 60, 240, 5],
+    ['WZ0003', '香肠', '原料', '份', 5, 5, 60, 240, 7],
+    ['WZ0004', '鲜柠檬', '原料', '份', 2, 2, 70, 280, 4],
+    ['WZ0005', '果味糖浆', '原料', '瓶', 8, 8, 30, 100, 30],
+    ['WZ0006', '爆米花纸盒', '包装', '个', 1, 1, 100, 400, 0],
+    ['WZ0007', '防油热狗袋', '包装', '个', 1, 1, 100, 400, 0],
+    ['WZ0008', '一次性饮料杯', '包装', '个', 1, 1, 120, 480, 0],
+    ['WZ0009', '吉祥物公仔', '百货', '个', 12, 12, 20, 80, 0],
+    ['WZ0010', '纪念T恤', '百货', '件', 20, 20, 15, 60, 0],
+    ['WZ0011', '主题钥匙扣', '百货', '个', 6, 6, 25, 100, 0]
+  ]
+  mats.forEach(m => im.run(...m))
+
+  // 商铺物资目录：每卖 1 份商品消耗对应物资（餐饮 = 主料 + 包材，百货/饮品单一物料）
+  const ivm = db.prepare('INSERT OR IGNORE INTO vendor_materials(vendor_id,material_id,qty_per_sale) VALUES(?,?,?)')
+  const matCodeId = code => db.prepare('SELECT id FROM materials WHERE code=?').get(code)?.id
+  const links = [
+    [1, 'WZ0001', 1], [1, 'WZ0006', 1],   // 爆米花小屋：玉米粒 + 纸盒
+    [2, 'WZ0009', 1], [2, 'WZ0010', 1], [2, 'WZ0011', 1], // 纪念品旗舰：公仔/T恤/钥匙扣（随机其一，销售时按库存比例分摊）
+    [3, 'WZ0004', 1], [3, 'WZ0005', 1], [3, 'WZ0008', 1], // 冰爽柠檬饮：柠檬 + 糖浆 + 杯
+    [4, 'WZ0002', 1], [4, 'WZ0003', 1], [4, 'WZ0007', 1], // 热狗快餐：面包胚 + 香肠 + 包装袋
+    [5, 'WZ0009', 1]                        // 玩具总动员：公仔
+  ]
+  links.forEach(([v, code, q]) => { const mid = matCodeId(code); if (mid) ivm.run(v, mid, q) })
+
+  // 期初库存：库存批次（带成本/保质期）+ 汇总计数器 + 期初入库流水，保证三者口径一致
+  const opening = [
+    ['WZ0001', 260, 10], ['WZ0002', 200, 5], ['WZ0003', 200, 7], ['WZ0004', 220, 4],
+    ['WZ0005', 80, 30], ['WZ0006', 340, 0], ['WZ0007', 320, 0], ['WZ0008', 400, 0],
+    ['WZ0009', 60, 0], ['WZ0010', 45, 0], ['WZ0011', 80, 0]
+  ]
+  for (const [code, qty, shelf] of opening) {
+    const m = db.prepare('SELECT * FROM materials WHERE code=?').get(code)
+    if (!m) continue
+    const exist = db.prepare('SELECT COUNT(*) n FROM material_stock WHERE material_id=?').get(m.id).n
+    if (exist) continue
+    db.prepare('INSERT INTO stock_batches(material_id,inbound_item_id,qty_in,qty_remain,unit_cost,expire_day,in_day,in_tick) VALUES(?,NULL,?,?,?,?,1,0)')
+      .run(m.id, qty, qty, m.std_cost, shelf ? 1 + shelf : 0)
+    db.prepare('INSERT INTO material_stock(material_id,onhand_qty,avg_cost,total_in_qty) VALUES(?,?,?,?)')
+      .run(m.id, qty, m.std_cost, qty)
+    db.prepare(`INSERT INTO stock_ledger(material_id,change_qty,balance_after,kind,ref_type,unit_cost,day,tick,note)
+                VALUES(? ,?, ?, 'inbound','open', ?, 1, 0, '期初库存')`)
+      .run(m.id, qty, qty, m.std_cost)
+  }
+}
+ensureProcurementBaseData()
 
 export default db
 export { now, getSetting, setSetting, tx, afterCommit }
